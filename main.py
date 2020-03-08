@@ -24,6 +24,7 @@ class RFIDfy:
 	addToDBButtonEvent = threading.Event() #Detects the press of a button
 	playingEvent = threading.Event() #Detects the next / previous event button
 	checkIfPlayingFlag = threading.Event() #Flag active when the threadPlayCheck needs to stop
+	checkAssociateTypeFlag = threading.Event() #Flag active when the threadAssociateCheck needs to stop
 
 	addToDBButtonPin = 40 #GPIO21
 	addToDBLedPin = 7 #GPIO4
@@ -32,6 +33,10 @@ class RFIDfy:
 	prevTrackButtonPin = 15 #GPIO22
 	playPauseTrackButtonPin = 16 #GPIO23
 	RFIDPin = None #IRQ Pin, set later.
+	selector1Pin = 35 #GPIO19
+	selector2Pin = 36 #GPIO16
+	selector3Pin = 37 #GPIO26
+	selector4Pin = 38 #GPIO20
 
 	def __init__(self):
 		GPIO.setmode(GPIO.BOARD)
@@ -45,10 +50,19 @@ class RFIDfy:
 		GPIO.add_event_detect(self.prevTrackButtonPin, GPIO.FALLING, callback=self.prevNextEventDetected, bouncetime=500)
 
 		GPIO.setup(self.playPauseTrackButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-		GPIO.add_event_detect(self.playPauseTrackButtonPin, GPIO.FALLING, callback=self.prevNextEventDetected, bouncetime=500)
+		GPIO.add_event_detect(self.playPauseTrackButtonPin, GPIO.BOTH, callback=self.prevNextEventDetected, bouncetime=500)
 		
 		GPIO.setup(self.addToDBLedPin, GPIO.OUT, initial=GPIO.LOW)
 		GPIO.setup(self.playingLedPin, GPIO.OUT, initial=GPIO.LOW)
+
+		GPIO.setup(self.selector1Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+		GPIO.setup(self.selector2Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+		GPIO.setup(self.selector3Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+		GPIO.setup(self.selector4Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+		GPIO.add_event_detect(self.selector1Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
+		GPIO.add_event_detect(self.selector2Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
+		GPIO.add_event_detect(self.selector3Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
+		GPIO.add_event_detect(self.selector4Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
 
 		self.authenticateSpotify() #sets self.sp
 		print('Connected to Spotify')
@@ -73,6 +87,8 @@ class RFIDfy:
 
 		threadPlayCheck = threading.Thread(target = self.checkIfPlaying)
 		threadPlayCheck.start()
+		threadAssociateCheck = threading.Thread(target = self.checkAssociateType)
+		threadAssociateCheck.start()
 
 		while True:
 			print('Waiting for event (button, RFID Tag)...')
@@ -145,6 +161,7 @@ class RFIDfy:
 
 		else: #self.addToDBButtonEvent.isSet() == True # there was a Link event
 			GPIO.output(self.addToDBLedPin, GPIO.HIGH)
+			self.getCurrentlyPlayingURI()
 			rfid_uid = self.reader.wait_for_tag_uid(timeout = 5)
 			if rfid_uid != None:
 				self.addCurrentlyPlayingToDB(rfid_uid)
@@ -176,11 +193,37 @@ class RFIDfy:
 		#Checks if playing on spotify API every 5s (in case of manual play / pause)
 		while not self.checkIfPlayingFlag.isSet():
 			result = self.sp.currently_playing()
-			if result['is_playing']:
+			if result and result['is_playing']:
 				GPIO.output(self.playingLedPin, GPIO.HIGH)
 			else:
 				GPIO.output(self.playingLedPin, GPIO.LOW)
 			self.checkIfPlayingFlag.wait(5)
+
+	def checkAssociateType(self):
+		#Run every 10s to check the type of association in case of an error with the selector system
+		while not self.checkAssociateTypeFlag.isSet():
+			if not GPIO.input(self.selector2Pin):
+				self.associateType = 'playlist'
+			elif not GPIO.input(self.selector3Pin):
+				self.associateType = 'artist'
+			elif not GPIO.input(self.selector4Pin):
+				self.associateType = 'album'
+			else:
+				self.associateType = 'track'
+
+			self.checkAssociateTypeFlag.wait(10)
+
+	def associateTypeChange(self, pin):
+		if pin == self.selector2Pin:
+			self.associateType = 'playlist'
+		elif pin == self.selector3Pin:
+			self.associateType = 'artist'
+		elif pin == self.selector4Pin:
+			self.associateType = 'album'
+		else:
+			self.associateType = 'track'
+
+		print('Current type {}'.format(self.associateType))
 
 
 	#------------------ Software related functions
@@ -240,7 +283,7 @@ class RFIDfy:
 			self.conn.commit()
 			print('Card re-assigned.')
 		elif result and result[0] == spotify_URI:
-			print('Card already associated.')
+			print('Card already associated with this URI.')
 		else: 
 		#First time we assign this card
 			self.cursor.execute("""
@@ -253,36 +296,47 @@ class RFIDfy:
 
 	def getCurrentlyPlayingURI(self):
 		result = self.sp.currently_playing()
-		 # u'context': {u'external_urls': {u'spotify': u'https://open.spotify.com/artist/4LXBc13z5EWsc5N32bLxfH'},
-		 #			  u'href': u'https://api.spotify.com/v1/artists/4LXBc13z5EWsc5N32bLxfH',
-		 #			  u'type': u'artist',
-		 #			  u'uri': u'spotify:artist:4LXBc13z5EWsc5N32bLxfH'},
-		 
-		 # u'context': {u'external_urls': {u'spotify': u'https://open.spotify.com/playlist/6pnEs66ugTnOY4PvjmUqY0'},
-		 #			  u'href': u'https://api.spotify.com/v1/playlists/6pnEs66ugTnOY4PvjmUqY0',
-		 #			  u'type': u'playlist',
-		 #			  u'uri': u'spotify:user:val34322:playlist:6pnEs66ugTnOY4PvjmUqY0'},
-
-		 # u'context': { u'external_urls': {u'spotify': u'https://open.spotify.com/album/7DxvbZIXVgixTbo3sZ15Gy'},
-		 #	 		u'href': u'https://api.spotify.com/v1/albums/7DxvbZIXVgixTbo3sZ15Gy',
-		 # 			u'type': u'album', 
-		 # 			u'uri': u'spotify:album:7DxvbZIXVgixTbo3sZ15Gy', 
-		
-		if result['context']:
-			spotify_URI = result['context']['uri']
-		elif result['item']:
+		# {u'context': {u'external_urls': {u'spotify': u'https://open.spotify.com/playlist/08A6NYKrsgPZ9VhCK1O80H'},
+		#               u'href': u'https://api.spotify.com/v1/playlists/08A6NYKrsgPZ9VhCK1O80H',
+		#               u'type': u'playlist',
+		#               u'uri': u'spotify:user:val34322:playlist:08A6NYKrsgPZ9VhCK1O80H'},
+		#  u'currently_playing_type': u'track',
+		#  u'is_playing': True,
+		#  u'item': {u'album': {u'album_type': u'album',
+		#                       u'artists': [...],
+		#                       u'type': u'album',
+		#                       u'uri': u'spotify:album:5zj0qH4lKPQOotmWkE3ECb'},
+		#            u'artists': [{u'external_urls': {u'spotify': u'https://open.spotify.com/artist/2nq2BeSbzExGAv3Y4HgUf7'},
+		#                          u'href': u'https://api.spotify.com/v1/artists/2nq2BeSbzExGAv3Y4HgUf7',
+		#                          u'id': u'2nq2BeSbzExGAv3Y4HgUf7',
+		#                          u'name': u'Stephan Bodzin',
+		#                          u'type': u'artist',
+		#                          u'uri': u'spotify:artist:2nq2BeSbzExGAv3Y4HgUf7'}],
+		#            u'type': u'track',
+		#            u'uri': u'spotify:track:0yuJtvXsapVOQfNDYxQ5mw'},
+		#  u'progress_ms': 8379,
+		#  u'timestamp': 1583699924931L}
+		spotify_URI = None
+		if self.associateType == 'track' and result and result['item']:
 			spotify_URI = result['item']['uri']
+		elif self.associateType == 'artist'and result and result['item'] and result['item']['artists']:
+			spotify_URI = result['item']['artists'][0]['uri']
+		elif self.associateType == 'playlist'and result and result['context'] and 'playlist' in result['context']['uri']:
+			spotify_URI = result['context']['uri']
+		elif self.associateType == 'album'and result and result['item'] and result['item']['album']:
+			spotify_URI = result['item']['album']['uri']
+
 		return spotify_URI
 
 	def addCurrentlyPlayingToDB(self, rfid_uid):
 		spotify_URI = self.getCurrentlyPlayingURI()
-		
+		print(spotify_URI)
 		if spotify_URI:
 			self.addToDB(spotify_URI, rfid_uid)
 
 	def startPlaying(self):
 		result = self.sp.currently_playing()
-		if not result['is_playing']:
+		if result and not result['is_playing']:
 			self.sp.start_playback()
 
 	def playRFIDTag(self):
@@ -300,13 +354,14 @@ class RFIDfy:
 
 			print('RFID read : {} {}'.format(spotify_URI, play_nb))
 
-			if spotify_URI != self.getCurrentlyPlayingURI(): #if not already playing...
+			currentlyPlayingURI = self.getCurrentlyPlayingURI()
+			if spotify_URI != currentlyPlayingURI and 'track' in spotify_URI: #if not already playing...
 				#Play the URI at the requested spot:
-				if 'track' in spotify_URI: #For tracks
 					self.sp.start_playback(uris=[spotify_URI], offset=None)
-				else:#For playlists, artists, ...
-					self.sp.start_playback(context_uri=spotify_URI, offset=None)
+			elif 'track' not in spotify_URI:#For playlists, artists, ...
+				self.sp.start_playback(context_uri=spotify_URI, offset=None)
 
+			if spotify_URI != currentlyPlayingURI:
 				#Increase the counter
 				self.cursor.execute("UPDATE RFIDPool SET play_nb = ? WHERE rfid_uid = ?", (play_nb+1, rfid_uid))
 				self.conn.commit()
@@ -315,39 +370,9 @@ try:
 	box.start()
 except:
 	box.checkIfPlayingFlag.set()
+	box.checkAssociateTypeFlag.set()
 	raise
 finally:
 	print('Cleaning up...')
 	GPIO.cleanup() #Ensures it's always clean
 	#conn.close() #Close the connection to the DB
-
-# # Play songs
-# while True:
-
-# 	#Calls handle event and then returns...
-
-
-# 	rfid_uid = reader.waitForTagUID()
-# 	cursor.execute("SELECT spotify_URI, play_nb FROM RFIDPool WHERE rfid_uid = ?", (rfid_uid,))
-# 	result = cursor.fetchone()
-
-# 	if cursor.rowcount == 0:
-# 		print('Unregistered RFID card')
-# 	else: 
-# 		spotify_URI, play_nb = result[0], result[1]
-# 		#Example URI : spotify:album:6cjXNVPvBuQdrCbllisAbD
-
-# 		print('RFID read : {} {}'.format(spotify_URI, play_nb))
-
-# 		#Play the URI at the requested spot:
-# 		#sp.start_playback(context_uri=spotify_URI, offset=None)
-
-# 		#Increase the counter
-# 		cursor.execute("UPDATE RFIDPool SET play_nb = ? WHERE rfid_uid = ?", (play_nb+1, rfid_uid))
-# 		conn.commit()
-
-# 	 # Wait 2s before reading another tag
-
-
-
-

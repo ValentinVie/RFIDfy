@@ -55,7 +55,7 @@ class RFID(object):
 	reg_tx_control = 0x14
 	length = 16
 
-	antenna_gain = 0x04
+	antenna_gain = 0x06
 
 #antenna_gain
 #  defines the receiver's signal voltage gain factor:
