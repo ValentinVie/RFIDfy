@@ -5,6 +5,7 @@ import time
 
 # The spotify wrapper to request the API
 import spotipy.util as util
+import spotipy.oauth2 as oauth2
 import spotipy
 
 # The config for the Spotfiy API and for the DB
@@ -13,6 +14,7 @@ import config
 # The functions necessary to read the RFID tag
 from pirc522 import RFID
 import RPi.GPIO as GPIO
+GPIO.setmode(GPIO.BOARD)
 
 # Handles the link with the DB holding the spotify song/album/artist ID
 import sqlite3
@@ -21,14 +23,12 @@ import sqlite3
 import threading
 
 class RFIDfy:
-	addToDBButtonEvent = threading.Event() #Detects the press of a button
-	playingEvent = threading.Event() #Detects the next / previous event button
-	checkIfPlayingFlag = threading.Event() #Flag active when the threadPlayCheck needs to stop
-	checkAssociateTypeFlag = threading.Event() #Flag active when the threadAssociateCheck needs to stop
-
 	addToDBButtonPin = 40 #GPIO21
+
 	addToDBLedPin = 7 #GPIO4
 	playingLedPin = 11 #GPIO17
+	systemEventLedPin = 12 #GPIO18
+
 	nextTrackButtonPin = 13 #GPIO27
 	prevTrackButtonPin = 15 #GPIO22
 	playPauseTrackButtonPin = 16 #GPIO23
@@ -39,7 +39,13 @@ class RFIDfy:
 	selector4Pin = 38 #GPIO20
 
 	def __init__(self):
-		GPIO.setmode(GPIO.BOARD)
+		self.addToDBButtonEvent = threading.Event() #Detects the press of a button
+		self.playingEvent = threading.Event() #Detects the next / previous event button
+		self.checkIfPlayingFlag = threading.Event() #Flag active when the threadPlayCheck needs to stop
+		self.checkAssociateTypeFlag = threading.Event() #Flag active when the threadAssociateCheck needs to stop
+		self.killSwitchFlag = threading.Event() #Flag active when the all processes/threads/loops in the class needs to stop
+
+
 		GPIO.setup(self.addToDBButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 		GPIO.add_event_detect(self.addToDBButtonPin, GPIO.FALLING, callback=self.addToDBEventDetected, bouncetime=500)
 		
@@ -54,6 +60,7 @@ class RFIDfy:
 		
 		GPIO.setup(self.addToDBLedPin, GPIO.OUT, initial=GPIO.LOW)
 		GPIO.setup(self.playingLedPin, GPIO.OUT, initial=GPIO.LOW)
+		GPIO.setup(self.systemEventLedPin, GPIO.OUT, initial=GPIO.LOW)
 
 		GPIO.setup(self.selector1Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 		GPIO.setup(self.selector2Pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -64,7 +71,7 @@ class RFIDfy:
 		GPIO.add_event_detect(self.selector3Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
 		GPIO.add_event_detect(self.selector4Pin, GPIO.FALLING, callback=self.associateTypeChange, bouncetime=500)
 
-		self.authenticateSpotify() #sets self.sp
+		self.authenticateSpotify() #sets self.sp and self.credentials
 		print('Connected to Spotify')
 		
 		self.connectDatabase() #sets self.conn & self.cursor
@@ -76,23 +83,53 @@ class RFIDfy:
 
 		self.associateType = 'track' #playlist or artist or album
 
+
+
 	#------------------ Hardware related functions
 	def start(self):
 		thread1 = threading.Thread(target = self.blinkLed, args = (self.playingLedPin,))
 		thread1.start()
-		self.startPlaying()
-		thread1.join()
+		thread2 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,))
+		thread2.start()
+		thread2.join()
 		GPIO.output(self.playingLedPin, GPIO.HIGH)
-		#self.setRaspberryAsActiveDevice()
+
+		self.startPlaying()
+		self.setRaspberryAsActiveDevice()
+
+		try :
+			self.sp.shuffle(True)
+		except :
+			print('Impossible to shuffle...')
 
 		threadPlayCheck = threading.Thread(target = self.checkIfPlaying)
 		threadPlayCheck.start()
 		threadAssociateCheck = threading.Thread(target = self.checkAssociateType)
 		threadAssociateCheck.start()
 
-		while True:
-			print('Waiting for event (button, RFID Tag)...')
-			self.waitForEvent()
+		# Main loop
+		try : 
+			while True:
+				print('Waiting for event (button, RFID Tag)...')
+				self.waitForEvent()
+				if self.killSwitchFlag.isSet():
+					print('End RFIDfy process.')
+					break
+
+		except spotipy.client.SpotifyException as spError:
+			print('Spotify Error', str(spError))
+			self.refreshToken()
+			thread2 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,), kwargs={'intervalOn': 0.2, 'intervalOff' : 0.2, 'times' : 2})
+			thread2.start()
+			thread2.join()
+			self.start()
+
+		except KeyboardInterrupt :
+			thread3 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,))
+			thread3.start()
+			thread3.join()
+			raise
+
 
 	def addToDBEventDetected(self, pinNb): # Press of a button
 		self.addToDBButtonEvent.set()
@@ -104,7 +141,8 @@ class RFIDfy:
 		threadPlay = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
 		threadPause = threading.Thread(target = self.blinkLed, args = (self.playingLedPin,))
 			
-		if pinNb == self.nextTrackButtonPin or pinNb == self.prevTrackButtonPin:
+		if pinNb == self.nextTrackButtonPin or pinNb == self.prevTrackButtonPin: 
+		# If we pressed the next or prev button
 			threadPlay.start()
 			
 			if pinNb == self.nextTrackButtonPin:
@@ -124,6 +162,7 @@ class RFIDfy:
 						self.sp.seek_track(0)
 			
 		elif pinNb == self.playPauseTrackButtonPin:
+		# if we pressed the play pause button
 			result = self.sp.currently_playing()
 			if not result['is_playing']:
 				threadPlay.start()
@@ -141,7 +180,7 @@ class RFIDfy:
 		# Wait for it
 		waiting = True
 
-		while waiting:
+		while not self.killSwitchFlag.isSet() and waiting:
 			self.reader.init()
 			self.reader.dev_write(0x04, 0x00)
 			self.reader.dev_write(0x02, 0xA0)
@@ -153,23 +192,24 @@ class RFIDfy:
 		self.reader.init()
 
 		if self.tagEvent.isSet(): #We read a tag
-			thread1 = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
-			thread1.start()
-
 			self.playRFIDTag()
 			time.sleep(2)
 
-		else: #self.addToDBButtonEvent.isSet() == True # there was a Link event
+
+		elif self.addToDBButtonEvent.isSet(): # there was a Link event
 			GPIO.output(self.addToDBLedPin, GPIO.HIGH)
 			self.getCurrentlyPlayingURI()
 			rfid_uid = self.reader.wait_for_tag_uid(timeout = 5)
+			print('Tag UID: ', rfid_uid)
 			if rfid_uid != None:
 				self.addCurrentlyPlayingToDB(rfid_uid)
 				GPIO.output(self.addToDBLedPin, GPIO.LOW)
 				self.blinkLed(self.addToDBLedPin)
 				time.sleep(2)
+			else:
+				thread1 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,), kwargs = {'intervalOn': 1, 'intervalOff' : 0.1, 'times' : 2})
+				thread1.start()
 			GPIO.output(self.addToDBLedPin, GPIO.LOW)
-
 
 		self.tagEvent.clear()
 		self.addToDBButtonEvent.clear()
@@ -235,16 +275,25 @@ class RFIDfy:
 		scope = config.scope
 		redirect_uri = config.redirect_uri
 
+		#self.credentials = oauth2.SpotifyClientCredentials(client_id=CLIENT_ID,
+		#        		client_secret=CLIENT_SECRET)
+		#token = self.credentials.get_access_token()
 
 		token = util.prompt_for_user_token(USERNAME, scope, client_id=CLIENT_ID, \
 		client_secret=CLIENT_SECRET, redirect_uri=redirect_uri)
 
-		if token:
+		if token: #To refactor
 			self.sp = spotipy.Spotify(auth=token)
+
 		else:
 			print("Authenticating to Spotify failed. \nCan't get token for {}, \
 				check your credentials.".format(USERNAME))
 			sys.exit(-1)
+
+	def refreshToken(self):
+		cachedToken = self.credentials.get_cached_token()
+		refreshedToken = cached_token['refresh_token']
+		newToken = self.credentials.refresh_access_token(refreshed_token)
 
 	def connectDatabase(self):
 		self.conn = sqlite3.connect(config.DBFilename)
@@ -265,7 +314,7 @@ class RFIDfy:
 
 	def setRaspberryAsActiveDevice(self):
 		result = self.sp.devices()
-		print(result, config.DEVICE_NAME)
+		print('setRaspberryAsActiveDevice', result, config.DEVICE_NAME)
 		for device in result['devices']:
 			if device['name'] == config.DEVICE_NAME and not device['is_active']:
 				#We need to activate the device
@@ -330,7 +379,7 @@ class RFIDfy:
 
 	def addCurrentlyPlayingToDB(self, rfid_uid):
 		spotify_URI = self.getCurrentlyPlayingURI()
-		print(spotify_URI)
+		print('addCurrentlyPlayingToDB :', spotify_URI)
 		if spotify_URI:
 			self.addToDB(spotify_URI, rfid_uid)
 
@@ -343,36 +392,117 @@ class RFIDfy:
 		#Play the URI at the requested spot
 
 		rfid_uid = self.reader.wait_for_tag_uid()
-		self.cursor.execute("SELECT spotify_URI, play_nb FROM RFIDPool WHERE rfid_uid = ?", (rfid_uid,))
-		result = self.cursor.fetchone()
+		print('playRFIDTag - Tag UID: ', rfid_uid)
+		if rfid_uid:
+			self.cursor.execute("SELECT spotify_URI, play_nb FROM RFIDPool WHERE rfid_uid = ?", (rfid_uid,))
+			result = self.cursor.fetchone()
+			if self.cursor.rowcount == 0 or result == None:
+				thread1 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,))
+				thread1.start()
+				print('Unregistered RFID card')
+			else: 
+				spotify_URI, play_nb = result[0], result[1]
+				#Example URI : 'spotify:album:6cjXNVPvBuQdrCbllisAbD'
 
-		if self.cursor.rowcount == 0:
-			print('Unregistered RFID card')
-		else: 
-			spotify_URI, play_nb = result[0], result[1]
-			#Example URI : spotify:album:6cjXNVPvBuQdrCbllisAbD
+				print('RFID URI read : {} {}'.format(spotify_URI, play_nb))
 
-			print('RFID read : {} {}'.format(spotify_URI, play_nb))
-
-			currentlyPlayingURI = self.getCurrentlyPlayingURI()
-			if spotify_URI != currentlyPlayingURI and 'track' in spotify_URI: #if not already playing...
-				#Play the URI at the requested spot:
+				currentlyPlayingURI = self.getCurrentlyPlayingURI()
+				if spotify_URI == currentlyPlayingURI: #Already playing
+					thread1 = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,), kwargs = {'intervalOn': 0.1, 'intervalOff' : 0.1, 'times' : 2})
+					thread1.start()
+				elif spotify_URI != currentlyPlayingURI and 'track' in spotify_URI: #if not already playing...
+					#Play the URI at the requested spot:
 					self.sp.start_playback(uris=[spotify_URI], offset=None)
-			elif 'track' not in spotify_URI:#For playlists, artists, ...
-				self.sp.start_playback(context_uri=spotify_URI, offset=None)
+					#Blink playingLedPin
+					thread1 = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
+					thread1.start()
 
-			if spotify_URI != currentlyPlayingURI:
-				#Increase the counter
-				self.cursor.execute("UPDATE RFIDPool SET play_nb = ? WHERE rfid_uid = ?", (play_nb+1, rfid_uid))
-				self.conn.commit()
-try:
-	box = RFIDfy()
-	box.start()
-except:
-	box.checkIfPlayingFlag.set()
-	box.checkAssociateTypeFlag.set()
-	raise
-finally:
-	print('Cleaning up...')
-	GPIO.cleanup() #Ensures it's always clean
-	#conn.close() #Close the connection to the DB
+					# #Add same songs to queue
+					# reco = self.sp.recommendations(seed_tracks=[spotify_URI])
+					# if reco :
+					# 	for track in reco['tracks']:
+					# 		self.sp.add_to_queue(track['uri'])
+							
+				elif 'track' not in spotify_URI:#For playlists, artists, ...
+					#Play the URI at the requested spot:
+					self.sp.start_playback(context_uri=spotify_URI, offset=None)
+					#Blink playingLedPin
+					thread1 = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
+					thread1.start()
+				else: #Other system error
+					thread1 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,))
+					thread1.start()
+
+				if spotify_URI != currentlyPlayingURI:
+					#Increase the counter
+					self.cursor.execute("UPDATE RFIDPool SET play_nb = ? WHERE rfid_uid = ?", (play_nb+1, rfid_uid))
+					self.conn.commit()
+		else :
+			thread1 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,), kwargs = {'intervalOn': 1, 'intervalOff' : 0.1, 'times' : 2})
+			thread1.start()
+
+
+
+# Box can handle the error of the RFIDfy object and is in charge of the reset button.
+class Box : #long press should turn off the thing...
+	def __init__(self):
+		self.RFIDfy = None
+		self.resetButtonPin = 31 #GPIO6
+		self.resetFlag = threading.Event()
+
+		self.setupResetButton()
+
+	def powerOn(self):
+		while True :
+			print('-------- Lopping...')
+			waiting = False
+			if not waiting:
+				print('-------- New instance created')
+				try:
+					self.RFIDfy = RFIDfy()
+					self.RFIDfy.start()
+				except KeyboardInterrupt : #We want to stop looping 
+					break
+				except:
+					raise
+				finally:
+					self.stopRFIDfy()
+					print('Cleaning up...')
+					GPIO.cleanup() #Ensures it's clean for the next RFIDfy instance
+					GPIO.setmode(GPIO.BOARD)
+					self.setupResetButton()
+					
+			waiting = self.resetFlag.wait(0.3)
+			if waiting :
+				self.resetFlag.clear()
+
+	def setupResetButton(self):
+		GPIO.setup(self.resetButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+		GPIO.add_event_detect(self.resetButtonPin, GPIO.FALLING, callback=self.resetBox, bouncetime=500)
+
+
+	def stopRFIDfy(self):
+		#end all threads
+		self.RFIDfy.checkIfPlayingFlag.set()
+		self.RFIDfy.checkAssociateTypeFlag.set()
+
+		#remove all event detect from the RFIDfy object
+		GPIO.remove_event_detect(self.RFIDfy.addToDBButtonPin)
+		GPIO.remove_event_detect(self.RFIDfy.nextTrackButtonPin)
+		GPIO.remove_event_detect(self.RFIDfy.prevTrackButtonPin)
+		GPIO.remove_event_detect(self.RFIDfy.playPauseTrackButtonPin)
+		GPIO.remove_event_detect(self.RFIDfy.selector1Pin)
+		GPIO.remove_event_detect(self.RFIDfy.selector2Pin)
+		GPIO.remove_event_detect(self.RFIDfy.selector3Pin)
+		GPIO.remove_event_detect(self.RFIDfy.selector4Pin)
+
+	def resetBox(self, pinNb):
+		self.RFIDfy.killSwitchFlag.set()
+		self.RFIDfy.checkIfPlayingFlag.set()
+		self.RFIDfy.checkAssociateTypeFlag.set()
+
+		self.resetFlag.set() #lets start over
+
+box = Box()
+box.powerOn()
+GPIO.cleanup() #Ensures it's always clean
