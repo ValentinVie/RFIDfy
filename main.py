@@ -16,6 +16,9 @@ from pirc522 import RFID
 import RPi.GPIO as GPIO
 GPIO.setmode(GPIO.BOARD)
 
+# The volume button class
+from volume_button import VolumeButton
+
 # Handles the link with the DB holding the spotify song/album/artist ID
 import sqlite3
 
@@ -37,6 +40,10 @@ class RFIDfy:
 	selector2Pin = 36 #GPIO16
 	selector3Pin = 37 #GPIO26
 	selector4Pin = 38 #GPIO20
+
+	volumeIncrement = 5 #In %
+	volumePinA = 29 # GPIO 5
+	volumePinB = 31 # GPIO 6
 
 	def __init__(self):
 		self.addToDBButtonEvent = threading.Event() #Detects the press of a button
@@ -82,8 +89,9 @@ class RFIDfy:
 		print('RFID reader ready')
 
 		self.associateType = 'track' #playlist or artist or album
-
-
+		
+		self.volume = 50 #between 0 and 100%
+		self.volumeButton = VolumeButton(self.volumePinA, self.volumePinB, self.volumeButtonCallback)
 
 	#------------------ Hardware related functions
 	def start(self):
@@ -95,7 +103,7 @@ class RFIDfy:
 		GPIO.output(self.playingLedPin, GPIO.HIGH)
 
 		self.startPlaying()
-		self.setRaspberryAsActiveDevice()
+		#self.setRaspberryAsActiveDevice()
 
 		try :
 			self.sp.shuffle(True)
@@ -118,7 +126,7 @@ class RFIDfy:
 
 		except spotipy.client.SpotifyException as spError:
 			print('Spotify Error', str(spError))
-			self.refreshToken()
+			self.refreshToken() #TODO
 			thread2 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,), kwargs={'intervalOn': 0.2, 'intervalOff' : 0.2, 'times' : 2})
 			thread2.start()
 			thread2.join()
@@ -128,7 +136,28 @@ class RFIDfy:
 			thread3 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,))
 			thread3.start()
 			thread3.join()
+			self.cancel()
 			raise
+
+	def cancel(self):
+		self.killSwitchFlag.set() #stop self.start() loop
+		self.pauseMusic()
+		self.reader.cancel()
+		self.volumeButton.cancel()
+
+		#end all threads
+		self.checkIfPlayingFlag.set()
+		self.checkAssociateTypeFlag.set()
+
+		#remove all event detect from the RFIDfy object
+		GPIO.remove_event_detect(self.addToDBButtonPin)
+		GPIO.remove_event_detect(self.nextTrackButtonPin)
+		GPIO.remove_event_detect(self.prevTrackButtonPin)
+		GPIO.remove_event_detect(self.playPauseTrackButtonPin)
+		GPIO.remove_event_detect(self.selector1Pin)
+		GPIO.remove_event_detect(self.selector2Pin)
+		GPIO.remove_event_detect(self.selector3Pin)
+		GPIO.remove_event_detect(self.selector4Pin)
 
 
 	def addToDBEventDetected(self, pinNb): # Press of a button
@@ -138,39 +167,19 @@ class RFIDfy:
 		self.reader.irq_callback()
 
 	def prevNextEventDetected(self, pinNb):# next previous track
-		threadPlay = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
-		threadPause = threading.Thread(target = self.blinkLed, args = (self.playingLedPin,))
-			
 		if pinNb == self.nextTrackButtonPin or pinNb == self.prevTrackButtonPin: 
 		# If we pressed the next or prev button
+			threadPlay = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
 			threadPlay.start()
 			
 			if pinNb == self.nextTrackButtonPin:
-				self.sp.next_track()
-				self.startPlaying()
+				self.playNextTrack()
 			elif pinNb == self.prevTrackButtonPin:
-				result = self.sp.currently_playing()
-				if result['is_playing'] and result['progress_ms'] > 10000: 
-				#playing for more than 10s we restart the track
-					self.sp.seek_track(0)
-				else:
-					try:
-						self.sp.previous_track() #Will fail if no previous track
-						self.startPlaying()
-					except:
-						print('Fail no previous track.')
-						self.sp.seek_track(0)
+				self.prevOrRestartTrack()
 			
 		elif pinNb == self.playPauseTrackButtonPin:
 		# if we pressed the play pause button
-			result = self.sp.currently_playing()
-			if not result['is_playing']:
-				threadPlay.start()
-				self.sp.start_playback()
-			elif result['is_playing']:
-				threadPause.start()
-				self.sp.pause_playback()
-
+			self.playPauseSwitch()
 
 	def waitForEvent(self):
 		self.reader.init()
@@ -441,23 +450,76 @@ class RFIDfy:
 			thread1 = threading.Thread(target = self.blinkLed, args = (self.systemEventLedPin,), kwargs = {'intervalOn': 1, 'intervalOff' : 0.1, 'times' : 2})
 			thread1.start()
 
+	def playNextTrack(self):
+		self.sp.next_track()
+		self.startPlaying()
+
+	def prevOrRestartTrack(self):
+		result = self.sp.currently_playing()
+		if result['is_playing'] and result['progress_ms'] > 10000: 
+		#playing for more than 10s we restart the track
+			self.sp.seek_track(0)
+		else:
+			try:
+				self.sp.previous_track() #Will fail if no previous track
+				self.startPlaying()
+			except:
+				print('Fail no previous track.')
+				self.sp.seek_track(0)
+
+	def playPauseSwitch(self):
+		threadPlay = threading.Thread(target = self.blinkLedStayOn, args = (self.playingLedPin,))
+		threadPause = threading.Thread(target = self.blinkLed, args = (self.playingLedPin,))
+		result = self.sp.currently_playing()
+		if not result['is_playing']:
+			threadPlay.start()
+			self.sp.start_playback()
+		elif result['is_playing']:
+			threadPause.start()
+			self.sp.pause_playback()
+
+	def pauseMusic(self):
+		result = self.sp.currently_playing()
+		if result['is_playing']:
+			GPIO.output(self.playingLedPin, GPIO.LOW)
+			self.sp.pause_playback()
+
+	def volumeButtonCallback(self, direction): #direction always -1 or +1
+		if direction == 1:
+			self.volume = max(self.volume-self.volumeIncrement, 0)
+		else:
+			self.volume = min(self.volume+self.volumeIncrement, 100)
+		self.sp.volume(self.volume)
 
 
-# Box can handle the error of the RFIDfy object and is in charge of the reset button.
+# Box can handle the error of the RFIDfy object and is in charge of the power button.
 class Box : #long press should turn off the thing...
 	def __init__(self):
 		self.RFIDfy = None
-		self.resetButtonPin = 31 #GPIO6
-		self.resetFlag = threading.Event()
+		self.resetButtonPin = 33 #GPIO13
+		self.stateFlag = threading.Event()
+		self.stateFlag.set() # because we want the RFIDfy object to run
+		self.state = 'ON' #or 'OFF'
 
 		self.setupResetButton()
 
+	def RFIDfyOff(self):
+		self.RFIDfy.cancel()
+		#end main RFIDfy thread
+		#end all other threads (checkIfPlaying, checkAssociateType)
+		#self.RFIDfy.checkIfPlayingFlag.set()
+		self.state = 'OFF'
+
+	def RFIDfyOn(self):
+		self.stateFlag.set() #Lets start over
+		self.state = 'ON'
+
 	def powerOn(self):
 		while True :
-			print('-------- Lopping...')
-			waiting = False
-			if not waiting:
+			print('-------- Waiting to be turned ON...')
+			if self.stateFlag.wait(5): #Blocking until self.RFIDfyOn is called
 				print('-------- New instance created')
+				self.stateFlag.clear()
 				try:
 					self.RFIDfy = RFIDfy()
 					self.RFIDfy.start()
@@ -466,43 +528,28 @@ class Box : #long press should turn off the thing...
 				except:
 					raise
 				finally:
-					self.stopRFIDfy()
-					print('Cleaning up...')
-					GPIO.cleanup() #Ensures it's clean for the next RFIDfy instance
-					GPIO.setmode(GPIO.BOARD)
-					self.setupResetButton()
-					
-			waiting = self.resetFlag.wait(0.3)
-			if waiting :
-				self.resetFlag.clear()
+					print('-------- Cleaning up...')
 
 	def setupResetButton(self):
 		GPIO.setup(self.resetButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-		GPIO.add_event_detect(self.resetButtonPin, GPIO.FALLING, callback=self.resetBox, bouncetime=500)
+		GPIO.add_event_detect(self.resetButtonPin, GPIO.FALLING, callback=self.RFIDfyOnOff, bouncetime=1000)
 
 
-	def stopRFIDfy(self):
-		#end all threads
-		self.RFIDfy.checkIfPlayingFlag.set()
-		self.RFIDfy.checkAssociateTypeFlag.set()
+	def RFIDfyOnOff(self, pinNb):
+		# self.RFIDfy.killSwitchFlag.set()
+		# self.RFIDfy.checkIfPlayingFlag.set()
+		# self.RFIDfy.checkAssociateTypeFlag.set()
 
-		#remove all event detect from the RFIDfy object
-		GPIO.remove_event_detect(self.RFIDfy.addToDBButtonPin)
-		GPIO.remove_event_detect(self.RFIDfy.nextTrackButtonPin)
-		GPIO.remove_event_detect(self.RFIDfy.prevTrackButtonPin)
-		GPIO.remove_event_detect(self.RFIDfy.playPauseTrackButtonPin)
-		GPIO.remove_event_detect(self.RFIDfy.selector1Pin)
-		GPIO.remove_event_detect(self.RFIDfy.selector2Pin)
-		GPIO.remove_event_detect(self.RFIDfy.selector3Pin)
-		GPIO.remove_event_detect(self.RFIDfy.selector4Pin)
+		# self.resetFlag.set() #lets start over
+		if self.state == 'ON':
+			print('-------- Going OFF')
+			self.RFIDfyOff()
+		else :
+			print('-------- Going ON')
+			self.RFIDfyOn()
+			
 
-	def resetBox(self, pinNb):
-		self.RFIDfy.killSwitchFlag.set()
-		self.RFIDfy.checkIfPlayingFlag.set()
-		self.RFIDfy.checkAssociateTypeFlag.set()
-
-		self.resetFlag.set() #lets start over
-
-box = Box()
-box.powerOn()
-GPIO.cleanup() #Ensures it's always clean
+if __name__ == "__main__":
+	box = Box()
+	box.powerOn()
+	GPIO.cleanup() #Ensures it's always clean

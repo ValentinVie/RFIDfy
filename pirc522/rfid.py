@@ -435,6 +435,11 @@ class RFID(object):
 			self.stop_crypto()
 		GPIO.cleanup()
 
+	def cancel(self):
+		if self.authed:
+			self.stop_crypto()
+		GPIO.remove_event_detect(self.pin_irq)
+
 	def wait_for_tag_uid(self, timeout = None):
 		if timeout == None:
 			timeout = self.default_timeout
